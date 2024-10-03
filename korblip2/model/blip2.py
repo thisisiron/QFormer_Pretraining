@@ -1,63 +1,55 @@
 import os
+import math
+from dataclasses import dataclass
+from typing import Any, Optional, Tuple, Union
 
 import torch
 from torch import nn
 
+from transformers.utils import ModelOutput
 
-from transformers.models.modeling_utils import PreTrainedModel
 from transformers import CLIPVisionModel, CLIPImageProcessor, CLIPVisionConfig
+from transformers.models.bert.configuration_bert import BertConfig
+from transformers.models.bert.modeling_bert import BertLMHeadModel
 
-from korblip2.model.image_encoder import CLIPVisionModel
+from transformers.models.auto import AutoModelForCausalLM, AutoModelForSeq2SeqLM 
+from transformers.models.blip_2.configuration_blip_2 import Blip2Config, Blip2QFormerConfig, Blip2VisionConfig
+from transformers.models.blip_2.modeling_blip_2 import Blip2Model
+
+from .base import Blip2PreTrainedModel
 
 
-class Blip2PreTrainedModel(PreTrainedModel):
+@dataclass
+class Blip2ForConditionalGenerationModelOutput(ModelOutput):
     """
-    An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
-    models.
+    Class defining the outputs of [`Blip2ForConditionalGeneration`].
+
+    Args:
+        loss (`torch.FloatTensor`, *optional*, returned when `labels` is provided, `torch.FloatTensor` of shape `(1,)`):
+            Language modeling loss from the language model.
+        logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
+            Prediction scores of the language modeling head of the language model.
+        vision_outputs (`BaseModelOutputWithPooling`):
+            Outputs of the vision encoder.
+        qformer_outputs (`BaseModelOutputWithPoolingAndCrossAttentions`):
+            Outputs of the Q-Former (Querying Transformer).
+        language_model_outputs (`CausalLMOutputWithPast` or `Seq2SeqLMOutput`):
+            Outputs of the language model.
     """
 
-    config_class = Blip2Config
-    base_model_prefix = "blip"
-    supports_gradient_checkpointing = True
-    _no_split_modules = [
-        "Blip2Attention",
-        "Blip2QFormerMultiHeadAttention",
-        "Blip2TextEmbeddings",
-        "T5Block",
-        "OPTDecoderLayer",
-    ]
-    _skip_keys_device_placement = "past_key_values"
-    _keep_in_fp32_modules = ["wo"]
+    loss: Optional[Tuple[torch.FloatTensor]] = None
+    logits: Optional[Tuple[torch.FloatTensor]] = None
+    vision_outputs: Optional[torch.FloatTensor] = None
+    qformer_outputs: Optional[Tuple[torch.FloatTensor]] = None
+    language_model_outputs: Optional[Tuple[torch.FloatTensor]] = None
 
-    def _init_weights(self, module):
-        """Initialize the weights"""
-        factor = self.config.initializer_range
-        if isinstance(module, nn.Conv2d) or isinstance(module, nn.Embedding) or isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=factor)
-            if hasattr(module, "bias") and module.bias is not None:
-                module.bias.data.zero_()
-
-        if isinstance(module, Blip2VisionEmbeddings):
-            if hasattr(self.config, "vision_config") and not isinstance(self.config, Blip2VisionConfig):
-                factor = self.config.vision_config.initializer_range
-            nn.init.trunc_normal_(module.position_embedding, mean=0.0, std=factor)
-            nn.init.trunc_normal_(module.class_embedding, mean=0.0, std=factor)
-
-        elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
-        elif isinstance(module, nn.Linear) and module.bias is not None:
-            module.bias.data.zero_()
-
-
-class BLIP2(nn.Module):
-    
-    def init_tokenizer(self,):
-        self.tokenizer = BertTokenizer.from_pretrained("klue/bert-base")
-        self.tokenizer.add_special_tokens({"bos_token": "[DEC]"})
-
-    def init_image_encoder(self, vision_model_name_or_path):
-        self.image_encoder = CLIPVisionModel(vision_model_name_or_path)
+    def to_tuple(self) -> Tuple[Any]:
+        return tuple(
+            self[k]
+            if k not in ["vision_outputs", "qformer_outputs", "language_model_outputs"]
+            else getattr(self, k).to_tuple()
+            for k in self.keys()
+        )
 
 
 class Blip2Model(Blip2PreTrainedModel):
@@ -67,7 +59,6 @@ class Blip2Model(Blip2PreTrainedModel):
     def __init__(self, config: Blip2Config):
         super().__init__(config)
 
-        # self.vision_model = Blip2VisionModel(config.vision_config)
         self.vision_model = CLIPVisionModel(config.vision_config)
 
         self.query_tokens = nn.Parameter(torch.zeros(1, config.num_query_tokens, config.qformer_config.hidden_size))
@@ -91,6 +82,25 @@ class Blip2Model(Blip2PreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    def from_pretrained_qformer(self):
+
+        bert_config = BertConfig.from_pretrained("klue/bert-base")
+        bert_config.is_decoder = True
+        bert_model = BertLMHeadModel.from_pretrained("klue/bert-base", config=bert_config)
+        bert_state_dict = bert_model.bert.state_dict()
+
+        new_state_dict = self.qformer.state_dict()
+        for i in range(len(bert_model.bert.encoder.layer)):
+            # BERT attention.self -> BLIP2QFormer attention.attention
+            new_state_dict[f'encoder.layer.{i}.attention.attention.query.weight'] = bert_state_dict[f'encoder.layer.{i}.attention.self.query.weight']
+            new_state_dict[f'encoder.layer.{i}.attention.attention.query.bias'] = bert_state_dict[f'encoder.layer.{i}.attention.self.query.bias']
+            new_state_dict[f'encoder.layer.{i}.attention.attention.key.weight'] = bert_state_dict[f'encoder.layer.{i}.attention.self.key.weight']
+            new_state_dict[f'encoder.layer.{i}.attention.attention.key.bias'] = bert_state_dict[f'encoder.layer.{i}.attention.self.key.bias']
+            new_state_dict[f'encoder.layer.{i}.attention.attention.value.weight'] = bert_state_dict[f'encoder.layer.{i}.attention.self.value.weight']
+            new_state_dict[f'encoder.layer.{i}.attention.attention.value.bias'] = bert_state_dict[f'encoder.layer.{i}.attention.self.value.bias']
+
+        self.qformer.load_state_dict(new_state_dict)
 
     def get_input_embeddings(self):
         return self.language_model.get_input_embeddings()
@@ -219,7 +229,6 @@ class Blip2Model(Blip2PreTrainedModel):
 
         return query_outputs
 
-    @replace_return_docstrings(output_type=Blip2ForConditionalGenerationModelOutput, config_class=Blip2VisionConfig)
     def forward(
         self,
         pixel_values: torch.FloatTensor,
