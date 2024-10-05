@@ -1,3 +1,4 @@
+import math
 from typing import Any, Optional, Tuple, Union
 
 import torch
@@ -11,6 +12,7 @@ from transformers.modeling_outputs import (
     BaseModelOutputWithPoolingAndCrossAttentions,
 )
 from transformers.models.blip_2.configuration_blip_2 import Blip2QFormerConfig
+from transformers.pytorch_utils import apply_chunking_to_forward
 
 from .base import Blip2PreTrainedModel
 
