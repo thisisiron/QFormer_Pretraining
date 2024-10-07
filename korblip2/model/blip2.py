@@ -6,6 +6,7 @@ from typing import Any, Optional, Tuple, Union
 import torch
 from torch.nn import functional as F
 import torch.distributed as dist
+from torch.distributed.nn.functional import all_gather as all_gather_with_backprop
 from torch import nn
 
 from transformers.utils import ModelOutput
@@ -30,7 +31,7 @@ def is_dist_avail_and_initialized():
 
 
 @torch.no_grad()
-def concat_all_gather(tensor):
+def concat_all_gather(tensor, with_grad=False):
     """
     Performs all_gather operation on the provided tensors.
     *** Warning ***: torch.distributed.all_gather has no gradient.
@@ -38,6 +39,9 @@ def concat_all_gather(tensor):
     # if use distributed training
     if not is_dist_avail_and_initialized():
         return tensor
+
+    if with_grad:
+        return torch.cat(all_gather_with_backprop(tensor), dim=0)
 
     tensors_gather = [
         torch.ones_like(tensor) for _ in range(torch.distributed.get_world_size())
@@ -92,12 +96,7 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
         self.vision_model = Blip2VisionModel(config.vision_config)
 
         self.query_tokens = nn.Parameter(torch.zeros(1, config.num_query_tokens, config.qformer_config.hidden_size))
-        # config.qformer_config.use_qformer_text_input = True
 
-        # self.tokenizer = BertTokenizer.from_pretrained("klue/bert-base")
-        # self.tokenizer.add_special_tokens({"bos_token": "[DEC]"})
-
-        # assert config.qformer_config.vocab_size == config.bert_config.vocab_size
         self.embeddings = Blip2TextEmbeddings(config.qformer_config)
         self.qformer = Blip2QFormerModel(config.qformer_config)
 
@@ -202,12 +201,12 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
         image_feats_all = concat_all_gather(image_feats)
         text_feats_all = concat_all_gather(text_feats)
 
-        import pdb;pdb.set_trace()
         sim_i2t = torch.matmul(image_feats, text_feats_all.t())
         sim_i2t, _ = sim_i2t.max(dim=1)
 
-        sim_t2i = torch.matmul(text_feats, image_feats_all.permute(0, 2, 1))
+        sim_t2i = torch.matmul(image_feats_all, text_feats.t())
         sim_t2i, _ = sim_t2i.max(dim=1)
+        sim_t2i = sim_t2i.t()
 
         rank = dist.get_rank()
         bs = image_embeds.shape[0]
@@ -220,67 +219,78 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
             + F.cross_entropy(sim_t2i, targets, label_smoothing=0.1)
         ) / 2
 
-        # ITC
-        # logits_per_image = torch.matmul(image_feats, text_feats.t())
-        # logits_per_image, _ = logits_per_image.max(dim=1)
-        # logits_per_text = logits_per_image.t()
 
+        sim_t2i[:, rank * bs : rank * bs + bs].fill_diagonal_(-10000)
+        sim_i2t[:, rank * bs : rank * bs + bs].fill_diagonal_(-10000)
 
-        if use_image_text_matching_head:
-            query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
-            query_attention_mask = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(query_tokens.device)
-            attention_mask = torch.cat([query_attention_mask, attention_mask], dim=1)
+        weights_t2i = F.softmax(sim_t2i, dim=1)
+        weights_i2t = F.softmax(sim_i2t, dim=1)
 
-            query_embeds = self.embeddings(
-                input_ids=input_ids,
-                query_embeds=query_tokens,
-            )
+        image_embeds_all = concat_all_gather(image_embeds, with_grad=True)
+        image_embeds_neg = []
+        for b in range(bs):
+            neg_idx = torch.multinomial(weights_t2i[b], 1).item()
+            image_embeds_neg.append(image_embeds_all[neg_idx])
+        image_embeds_neg = torch.stack(image_embeds_neg, dim=0)
 
-            text_outputs = self.qformer(
-                query_embeds=query_embeds,
-                query_length=query_tokens.shape[1],
-                attention_mask=attention_mask,
-                encoder_hidden_states=image_embeds,
-                encoder_attention_mask=image_attention_mask,
-                return_dict=return_dict,
-            )
-            text_embeds = text_outputs[0] if not return_dict else text_outputs.last_hidden_state
+        text_input_ids_all = concat_all_gather(input_ids)
+        text_attention_mask_all = concat_all_gather(attention_mask)
+        text_ids_neg = []
+        text_atts_neg = []
+        for b in range(bs):
+            neg_idx = torch.multinomial(weights_i2t[b], 1).item()
+            text_ids_neg.append(text_input_ids_all[neg_idx])
+            text_atts_neg.append(text_attention_mask_all[neg_idx])
 
-            output = self.itm_head(text_embeds[:, : query_tokens.size(1), :])
-            logits_per_image = output.mean(dim=1)
-            logits_per_text = logits_per_image.t()
-        else:
-            # ITC
-            # query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
-            # query_outputs = self.qformer(
-            #     query_embeds=query_tokens,
-            #     encoder_hidden_states=image_embeds,
-            #     encoder_attention_mask=image_attention_mask,
-            #     return_dict=return_dict,
-            # )
-            # image_embeds = query_outputs[0] if not return_dict else query_outputs.last_hidden_state
+        text_ids_neg = torch.stack(text_ids_neg, dim=0)
+        text_atts_neg = torch.stack(text_atts_neg, dim=0)
 
-            # query_embeds = self.embeddings(
-            #     input_ids=input_ids,
-            # )
-            # text_outputs = self.qformer(
-            #     query_embeds=query_embeds,
-            #     query_length=0,
-            #     attention_mask=attention_mask,
-            #     return_dict=return_dict,
-            # )
-            # question_embeds = text_outputs[0] if not return_dict else text_outputs.last_hidden_state
+        text_ids_all = torch.cat(
+            [input_ids, input_ids, text_ids_neg], dim=0
+        )  # pos, pos, neg
+        text_atts_all = torch.cat(
+            [attention_mask, attention_mask, text_atts_neg],
+            dim=0,
+        )
 
-            # normalized features
-            # image_embeds = nn.functional.normalize(self.vision_projection(image_embeds), dim=-1)
-            # text_embeds = nn.functional.normalize(self.text_projection(question_embeds[:, 0, :]), dim=-1)
+        query_tokens_itm = self.query_tokens.expand(text_ids_all.shape[0], -1, -1)
+        query_atts_itm = torch.ones(query_tokens_itm.size()[:-1], dtype=torch.long).to(
+            query_tokens_itm.device
+        )
+        attention_mask_all = torch.cat([query_atts_itm, text_atts_all], dim=1)
 
-            # cosine similarity as logits
-            # logits_per_image = torch.matmul(image_embeds, text_embeds.t())
-            # logits_per_image, _ = logits_per_image.max(dim=1)
+        query_embeds_itm = self.embeddings(
+            input_ids=text_ids_all,
+            query_embeds=query_tokens_itm,
+        )
 
-            # logits_per_text = logits_per_image.t()
-            pass
+        image_embeds_all = torch.cat(
+            [image_embeds, image_embeds_neg, image_embeds], dim=0
+        )  # pos, neg, pos
+        image_attention_mask_all = torch.ones(image_embeds_all.size()[:-1], dtype=torch.long).to(
+            image_embeds.device
+        )
+
+        text_outputs = self.qformer(
+            query_embeds=query_embeds_itm,
+            query_length=query_tokens_itm.shape[1],
+            attention_mask=attention_mask_all,
+            encoder_hidden_states=image_embeds_all,
+            encoder_attention_mask=image_attention_mask_all,
+            return_dict=return_dict,
+        )
+        text_embeds = text_outputs[0] if not return_dict else text_outputs.last_hidden_state
+        output = self.itm_head(text_embeds[:, : query_tokens_itm.size(1), :])
+        logits = output.mean(dim=1)
+        
+        itm_labels = torch.cat(
+            [torch.ones(bs, dtype=torch.long), torch.zeros(2 * bs, dtype=torch.long)],
+            dim=0,
+        ).to(image_embeds.device)
+        loss_itm = F.cross_entropy(logits, itm_labels)
+
+        print(loss_itc, loss_itm)
+
 
         if not return_dict:
             output = (logits_per_image, logits_per_text, text_embeds, image_embeds, text_outputs, vision_outputs)
