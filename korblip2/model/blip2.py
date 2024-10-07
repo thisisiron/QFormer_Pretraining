@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from typing import Any, Optional, Tuple, Union
 
 import torch
+from torch.nn import functional as F
+import torch.distributed as dist
 from torch import nn
 
 from transformers.utils import ModelOutput
@@ -17,6 +19,14 @@ from transformers.models.blip_2.modeling_blip_2 import Blip2Model, Blip2VisionMo
 
 from .base import Blip2PreTrainedModel
 from .qformer import Blip2QFormerModel, Blip2TextEmbeddings
+
+
+def is_dist_avail_and_initialized():
+    if not dist.is_available():
+        return False
+    if not dist.is_initialized():
+        return False
+    return True
 
 
 @torch.no_grad()
@@ -87,7 +97,7 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
         # self.tokenizer = BertTokenizer.from_pretrained("klue/bert-base")
         # self.tokenizer.add_special_tokens({"bos_token": "[DEC]"})
 
-        assert config.qformer_config.vocab_size == config.bert_config.vocab_size
+        # assert config.qformer_config.vocab_size == config.bert_config.vocab_size
         self.embeddings = Blip2TextEmbeddings(config.qformer_config)
         self.qformer = Blip2QFormerModel(config.qformer_config)
 
@@ -192,12 +202,28 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
         image_feats_all = concat_all_gather(image_feats)
         text_feats_all = concat_all_gather(text_feats)
 
+        import pdb;pdb.set_trace()
         sim_i2t = torch.matmul(image_feats, text_feats_all.t())
+        sim_i2t, _ = sim_i2t.max(dim=1)
+
+        sim_t2i = torch.matmul(text_feats, image_feats_all.permute(0, 2, 1))
+        sim_t2i, _ = sim_t2i.max(dim=1)
+
+        rank = dist.get_rank()
+        bs = image_embeds.shape[0]
+        targets = torch.linspace(rank * bs, rank * bs + bs - 1, bs, dtype=int).to(
+            image_embeds.device
+        )
+
+        loss_itc = (
+            F.cross_entropy(sim_i2t, targets, label_smoothing=0.1)
+            + F.cross_entropy(sim_t2i, targets, label_smoothing=0.1)
+        ) / 2
 
         # ITC
-        logits_per_image = torch.matmul(image_feats, text_feats.t())
-        logits_per_image, _ = logits_per_image.max(dim=1)
-        logits_per_text = logits_per_image.t()
+        # logits_per_image = torch.matmul(image_feats, text_feats.t())
+        # logits_per_image, _ = logits_per_image.max(dim=1)
+        # logits_per_text = logits_per_image.t()
 
 
         if use_image_text_matching_head:
