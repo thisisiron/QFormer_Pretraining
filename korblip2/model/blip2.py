@@ -92,6 +92,7 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
 
     def __init__(self, config: Blip2Config):
         super().__init__(config)
+        self.decoder_start_token_id= config.decoder_start_token_id
 
         self.vision_model = Blip2VisionModel(config.vision_config)
 
@@ -111,6 +112,18 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    def resize_token_embeddings(self, new_num_tokens: Optional[int] = None, pad_to_multiple_of=None) -> nn.Embedding:
+        model_embeds = super().resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
+        # update vocab size
+        self.config.qformer_config.vocab_size = model_embeds.num_embeddings
+        return model_embeds
+
+    def get_input_embeddings(self):
+        return self.embeddings.word_embeddings
+    
+    def set_input_embeddings(self, value):
+        self.embeddings.word_embedding = value 
 
     def from_pretrained_qformer(self):
 
@@ -153,6 +166,7 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
         pixel_values: torch.FloatTensor,
         input_ids: torch.LongTensor,
         attention_mask: Optional[torch.LongTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
         use_image_text_matching_head: Optional[bool] = False,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -173,17 +187,21 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
         )
 
         image_embeds = vision_outputs[0]
-        image_attention_mask = torch.ones(image_embeds.size()[:-1], dtype=torch.long, device=image_embeds.device)
+        image_attention_mask = torch.ones(image_embeds.size()[:-1], dtype=torch.long, device=pixel_values.device)
 
         query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
-        query_outputs = self.qformer(
+        query_embeds = self.embeddings(
             query_embeds=query_tokens,
+        )
+        query_outputs = self.qformer(
+            query_embeds=query_embeds,
             encoder_hidden_states=image_embeds,
             encoder_attention_mask=image_attention_mask,
-            return_dict=return_dict,
+            use_cache=True,
+            return_dict=True,
         )
-        query_outputs = query_outputs[0] if not return_dict else query_outputs.last_hidden_state
-        image_feats = nn.functional.normalize(self.vision_projection(query_outputs), dim=-1)
+        # query_outputs = query_outputs[0] if not return_dict else query_outputs.last_hidden_state
+        image_feats = nn.functional.normalize(self.vision_projection(query_outputs.last_hidden_state), dim=-1)
 
         # TODO: add tokenizer 
         text_embeds = self.embeddings(
@@ -208,10 +226,11 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
         sim_t2i, _ = sim_t2i.max(dim=1)
         sim_t2i = sim_t2i.t()
 
-        rank = dist.get_rank()
+        # rank = dist.get_rank()
+        rank = 0
         bs = image_embeds.shape[0]
         targets = torch.linspace(rank * bs, rank * bs + bs - 1, bs, dtype=int).to(
-            image_embeds.device
+            pixel_values.device
         )
 
         loss_itc = (
@@ -268,30 +287,62 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
             [image_embeds, image_embeds_neg, image_embeds], dim=0
         )  # pos, neg, pos
         image_attention_mask_all = torch.ones(image_embeds_all.size()[:-1], dtype=torch.long).to(
-            image_embeds.device
+            pixel_values.device
         )
 
-        text_outputs = self.qformer(
+        itm_outputs = self.qformer(
             query_embeds=query_embeds_itm,
             query_length=query_tokens_itm.shape[1],
             attention_mask=attention_mask_all,
             encoder_hidden_states=image_embeds_all,
             encoder_attention_mask=image_attention_mask_all,
-            return_dict=return_dict,
+            return_dict=True,
         )
-        text_embeds = text_outputs[0] if not return_dict else text_outputs.last_hidden_state
-        output = self.itm_head(text_embeds[:, : query_tokens_itm.size(1), :])
-        logits = output.mean(dim=1)
+        itm_embeds = itm_outputs[0] if not return_dict else itm_outputs.last_hidden_state
+        itm_outputs = self.itm_head(itm_embeds[:, : query_tokens_itm.size(1), :])
+        logits_itm = itm_outputs.mean(dim=1)
         
         itm_labels = torch.cat(
             [torch.ones(bs, dtype=torch.long), torch.zeros(2 * bs, dtype=torch.long)],
             dim=0,
-        ).to(image_embeds.device)
-        loss_itm = F.cross_entropy(logits, itm_labels)
+        ).to(pixel_values.device)
+        loss_itm = F.cross_entropy(logits_itm, itm_labels)
 
-        print(loss_itc, loss_itm)
+        # ITG
+        decoder_input_ids = input_ids.clone()
+        decoder_input_ids[:, 0] = self.decoder_start_token_id
 
+        query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(  # 4 32
+            pixel_values.device
+        )
 
+        decoder_embeds = self.embeddings(  # 4, 64, 768
+            input_ids=decoder_input_ids,
+            # query_embeds=query_tokens,
+        )
+
+        attention_mask_itg = torch.cat([query_atts, attention_mask], dim=1)
+
+        itg_outputs = self.qformer(
+            decoder_embeds,
+            query_length=0,
+            attention_mask=attention_mask_itg,
+            past_key_values=query_outputs.past_key_values,
+            return_dict=return_dict,
+        )
+        # logits_itg = itg_outputs.logits if return_dict else itg_outputs[0]
+        logits_itg = itg_outputs.logits
+
+        # labels = labels.to(logits_itg.device)
+        logits_itg = logits_itg[:, -labels.size(1) :, :]
+        # Shift so that tokens < n predict n
+        shift_logits = logits_itg[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous().to(logits_itg.device)
+
+        loss_fct = CrossEntropyLoss(reduction="mean")
+        loss_itg = loss_fct(shift_logits.view(-1, self.config.text_config.vocab_size), shift_labels.view(-1))
+
+        print(loss_itc, loss_itm, loss_itg)
         if not return_dict:
             output = (logits_per_image, logits_per_text, text_embeds, image_embeds, text_outputs, vision_outputs)
             return output
