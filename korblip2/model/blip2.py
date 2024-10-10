@@ -19,7 +19,7 @@ from transformers.models.blip_2.configuration_blip_2 import Blip2Config, Blip2QF
 from transformers.models.blip_2.modeling_blip_2 import Blip2Model, Blip2VisionModel
 
 from .base import Blip2PreTrainedModel
-from .qformer import Blip2QFormerModel, Blip2TextEmbeddings
+from .qformer import Blip2QFormerModel, Blip2TextEmbeddings, Blip2QFormerOnlyMLMHead
 
 
 def is_dist_avail_and_initialized():
@@ -100,6 +100,7 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
 
         self.embeddings = Blip2TextEmbeddings(config.qformer_config)
         self.qformer = Blip2QFormerModel(config.qformer_config)
+        self.cls = Blip2QFormerOnlyMLMHead(config.qformer_config)
 
         # vision projection layer
         self.vision_projection = nn.Linear(config.qformer_config.hidden_size, config.image_text_hidden_size)
@@ -124,6 +125,12 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
     
     def set_input_embeddings(self, value):
         self.embeddings.word_embedding = value 
+
+    def get_output_embeddings(self):
+        return self.cls.predictions.decoder
+
+    def set_output_embeddings(self, new_embeddings):
+        self.cls.predictions.decoder = new_embeddings
 
     def from_pretrained_qformer(self):
 
@@ -157,8 +164,7 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
             new_state_dict[new_key] = bert_state_dict[key]
 
         m, e = self.qformer.load_state_dict(new_state_dict, strict=False)
-        self.qformer.cls = bert_model.cls
-
+        self.cls.load_state_dict(bert_model.cls.state_dict())
         self.embeddings.load_state_dict(bert_model.bert.embeddings.state_dict(), strict=False)
 
     def forward(
@@ -328,10 +334,9 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
             query_length=0,
             attention_mask=attention_mask_itg,
             past_key_values=query_outputs.past_key_values,
-            return_dict=return_dict,
+            return_dict=True,
         )
-        # logits_itg = itg_outputs.logits if return_dict else itg_outputs[0]
-        logits_itg = itg_outputs.logits
+        logits_itg = self.cls(itg_outputs.last_hidden_state)
 
         # labels = labels.to(logits_itg.device)
         logits_itg = logits_itg[:, -labels.size(1) :, :]
@@ -339,8 +344,11 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
         shift_logits = logits_itg[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous().to(logits_itg.device)
 
-        loss_fct = CrossEntropyLoss(reduction="mean")
-        loss_itg = loss_fct(shift_logits.view(-1, self.config.text_config.vocab_size), shift_labels.view(-1))
+        # loss_fct = nn.CrossEntropyLoss(reduction="mean")
+        import pdb;pdb.set_trace()
+        print(self.config.qformer_config.vocab_size)
+        print(self.cls)
+        loss_itg = F.cross_entropy(shift_logits.view(-1, self.config.qformer_config.vocab_size), shift_labels.view(-1))
 
         print(loss_itc, loss_itm, loss_itg)
         if not return_dict:
