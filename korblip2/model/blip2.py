@@ -344,22 +344,17 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
         shift_logits = logits_itg[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous().to(logits_itg.device)
 
-        # loss_fct = nn.CrossEntropyLoss(reduction="mean")
-        import pdb;pdb.set_trace()
-        print(self.config.qformer_config.vocab_size)
-        print(self.cls)
         loss_itg = F.cross_entropy(shift_logits.view(-1, self.config.qformer_config.vocab_size), shift_labels.view(-1))
 
-        print(loss_itc, loss_itm, loss_itg)
         if not return_dict:
             output = (logits_per_image, logits_per_text, text_embeds, image_embeds, text_outputs, vision_outputs)
             return output
 
-        # return Blip2ImageTextMatchingModelOutput(
-        #     logits_per_image=logits_per_image,
-        #     logits_per_text=logits_per_text,
-        #     text_embeds=text_embeds,
-        #     image_embeds=image_embeds,
-        #     text_model_output=text_outputs,
-        #     vision_model_output=vision_outputs,
-        # )
+        return Blip2QFormerModelOutput(
+            logits_per_image=logits_per_image,
+            logits_per_text=logits_per_text,
+            text_embeds=text_embeds,
+            image_embeds=image_embeds,
+            text_model_output=text_outputs,
+            vision_model_output=vision_outputs,
+        )
