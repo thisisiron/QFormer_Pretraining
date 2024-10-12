@@ -52,6 +52,17 @@ def concat_all_gather(tensor, with_grad=False):
     return output
 
 
+@dataclass
+class Blip2QFormerModelOutput(ModelOutput):
+    # some finetuned models (e.g. BlipVQA) do not compute similarity, thus optional.
+    sims: Optional[BlipSimilarity] = None
+    intermediate_output: BlipIntermediateOutput = None
+    loss: Optional[torch.FloatTensor] = None
+    loss_itc: Optional[torch.FloatTensor] = None
+    loss_itm: Optional[torch.FloatTensor] = None
+    loss_itg: Optional[torch.FloatTensor] = None
+
+
 class Blip2ForQformerTraining(Blip2PreTrainedModel):
     main_input_name = "pixel_values"
     _keep_in_fp32_modules = []
@@ -317,10 +328,8 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
             return output
 
         return Blip2QFormerModelOutput(
-            logits_per_image=logits_per_image,
-            logits_per_text=logits_per_text,
-            text_embeds=text_embeds,
-            image_embeds=image_embeds,
-            text_model_output=text_outputs,
-            vision_model_output=vision_outputs,
+                loss=loss_itc + loss_itm + loss_itg
+                loss_itc=loss_itc,
+                loss_itm=loss_itm,
+                loss_itg=loss_itg,
         )
