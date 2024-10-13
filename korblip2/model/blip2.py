@@ -13,6 +13,11 @@ from transformers.utils import ModelOutput
 
 from transformers.models.bert.configuration_bert import BertConfig
 from transformers.models.bert.modeling_bert import BertLMHeadModel
+from transformers.modeling_outputs import (
+    ModelOutput,
+    BaseModelOutputWithPoolingAndCrossAttentions,
+    CausalLMOutputWithCrossAttentions
+)
 
 from transformers.models.auto import AutoModelForCausalLM, AutoModelForSeq2SeqLM 
 from transformers.models.blip_2.configuration_blip_2 import Blip2Config, Blip2QFormerConfig, Blip2VisionConfig
@@ -53,9 +58,29 @@ def concat_all_gather(tensor, with_grad=False):
 
 
 @dataclass
+class BlipIntermediateOutput(ModelOutput):
+    # uni-modal features
+    image_embeds: torch.FloatTensor = None
+    text_embeds: Optional[torch.FloatTensor] = None
+
+    image_embeds_m: Optional[torch.FloatTensor] = None
+    text_embeds_m: Optional[torch.FloatTensor] = None
+
+    # intermediate outputs of multimodal encoder
+    encoder_output: Optional[BaseModelOutputWithPoolingAndCrossAttentions] = None
+    encoder_output_neg: Optional[BaseModelOutputWithPoolingAndCrossAttentions] = None
+
+    itm_logits: Optional[torch.FloatTensor] = None
+    itm_labels: Optional[torch.LongTensor] = None
+
+    # intermediate outputs of multimodal decoder
+    decoder_output: Optional[CausalLMOutputWithCrossAttentions] = None
+    decoder_labels: Optional[torch.LongTensor] = None
+
+
+@dataclass
 class Blip2QFormerModelOutput(ModelOutput):
     # some finetuned models (e.g. BlipVQA) do not compute similarity, thus optional.
-    sims: Optional[BlipSimilarity] = None
     intermediate_output: BlipIntermediateOutput = None
     loss: Optional[torch.FloatTensor] = None
     loss_itc: Optional[torch.FloatTensor] = None
@@ -328,7 +353,7 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
             return output
 
         return Blip2QFormerModelOutput(
-                loss=loss_itc + loss_itm + loss_itg
+                loss=loss_itc + loss_itm + loss_itg,
                 loss_itc=loss_itc,
                 loss_itm=loss_itm,
                 loss_itg=loss_itg,
