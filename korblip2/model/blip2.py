@@ -349,7 +349,7 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
         loss_itg = F.cross_entropy(shift_logits.view(-1, self.config.qformer_config.vocab_size), shift_labels.view(-1))
 
         if not return_dict:
-            output = (logits_per_image, logits_per_text, text_embeds, image_embeds, text_outputs, vision_outputs)
+            output = (loss_itc + loss_itm + loss_itg)
             return output
 
         return Blip2QFormerModelOutput(
