@@ -134,7 +134,7 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
     def set_output_embeddings(self, new_embeddings):
         self.cls.predictions.decoder = new_embeddings
 
-    def from_pretrained_qformer(self):
+    def from_qformer_pretrained(self):
 
         bert_config = BertConfig.from_pretrained("klue/bert-base")
         bert_config.is_decoder = True
