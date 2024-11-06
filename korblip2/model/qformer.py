@@ -600,13 +600,13 @@ class Blip2QFormerModel(Blip2PreTrainedModel):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        # past_key_values_length
-        past_key_values_length = (
-            past_key_values[0][0].shape[2] - self.config.query_length if past_key_values is not None else 0
-        )
-
         query_length = (
             query_length if query_length is not None else query_embeds.shape[1] if query_embeds is not None else 0
+        )
+
+        # past_key_values_length
+        past_key_values_length = (
+            past_key_values[0][0].shape[2] - query_length if past_key_values is not None else 0
         )
 
         embedding_output = self.layernorm(query_embeds)

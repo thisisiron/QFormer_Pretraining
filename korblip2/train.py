@@ -1,7 +1,22 @@
 import os
+import sys
+import json
+import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
+import torch
+from torch.nn import functional as F
+from torchvision.transforms import (
+    Resize,
+    CenterCrop,
+    ConvertImageDtype,
+    Normalize,
+    InterpolationMode,
+)
+from torchvision.io import read_image, ImageReadMode
+from PIL import Image
+from datasets import load_dataset
 import transformers
 from transformers import (
     AutoConfig,
@@ -13,8 +28,11 @@ from transformers import (
     TrainingArguments,
     set_seed,
 )
+from model.blip2 import Blip2ForQformerTraining
+from transformers.models.blip_2.configuration_blip_2 import Blip2Config
 
-from transformers.models.blip_2.modeling_blip_2 import Blip2Model
+# Initialize logger
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -23,17 +41,18 @@ class ModelArguments:
     Arguments pertaining to which model/config/tokenizer we are going to fine-tune, or train from scratch.
     """
 
-    model_name_or_path: str = field(
-        default="Salesforce/blip2-opt-2.7b",
+    qformer_model_name_or_path: str = field(
+        default=None,
         metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"},
     )
-    config_name: Optional[str] = field(
-        default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
+    vision_model_name_or_path: str = field(
+        default=None,
+        metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"},
     )
-    tokenizer_name: Optional[str] = field(
-        default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
+    model_type: Optional[str] = field(
+        default=None,
+        # metadata={"help": "If training from scratch, pass a model type from the list: " + ", ".join(MODEL_TYPES)},
     )
-    image_processor_name: str = field(default=None, metadata={"help": "Name or path of preprocessor config."})
     cache_dir: Optional[str] = field(
         default=None, metadata={"help": "Where do you want to store the pretrained models downloaded from s3"}
     )
@@ -63,9 +82,6 @@ class ModelArguments:
                 " code, as it will execute code present on the Hub on your local machine."
             )
         },
-    )
-    freeze_vision_model: bool = field(
-        default=False, metadata={"help": "Whether to freeze the vision model parameters or not."}
     )
     freeze_text_model: bool = field(
         default=False, metadata={"help": "Whether to freeze the text model parameters or not."}
@@ -183,16 +199,22 @@ class Transform(torch.nn.Module):
         return x
 
 
-def collate_fn(examples):
-    pixel_values = torch.stack([example["pixel_values"] for example in examples])
-    input_ids = torch.tensor([example["input_ids"] for example in examples], dtype=torch.long)
-    attention_mask = torch.tensor([example["attention_mask"] for example in examples], dtype=torch.long)
-    return {
-        "pixel_values": pixel_values,
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "return_loss": True,
-    }
+def get_collate_fn(tokenizer):
+    def collate_fn(examples):
+        pixel_values = torch.stack([example["pixel_values"] for example in examples])
+        input_ids = torch.tensor([example["input_ids"] for example in examples], dtype=torch.long)
+        attention_mask = torch.tensor([example["attention_mask"] for example in examples], dtype=torch.long)
+        labels = input_ids.masked_fill(
+            input_ids == tokenizer.pad_token_id, -100
+        )
+        return {
+            "pixel_values": pixel_values,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "return_loss": True,
+        }
+    return collate_fn
 
 
 def main():
@@ -208,10 +230,6 @@ def main():
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-
-    # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
-    # information sent is the one passed as arguments along with your Python/PyTorch versions.
-    send_example_telemetry("run_clip", model_args, data_args)
 
     # 2. Setup logging
     logging.basicConfig(
@@ -252,14 +270,6 @@ def main():
                 "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
             )
 
-    # 4. Load dataset
-    # Get the datasets: you can either provide your own CSV/JSON training and evaluation files (see below)
-    # or just provide the name of one of the public datasets available on the hub at https://huggingface.co/datasets/
-    # (the dataset will be downloaded automatically from the datasets Hub).
-    #
-    # For CSV/JSON files this script will use the first column for the full image path and the second column for the
-    # captions (unless you specify column names for this with the `image_column` and `caption_column` arguments).
-    #
     if data_args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
         dataset = load_dataset(
@@ -288,26 +298,17 @@ def main():
             cache_dir=model_args.cache_dir,
             token=model_args.token,
         )
-    # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
-    # https://huggingface.co/docs/datasets/loading_datasets.
-
+    
     # 5. Load pretrained model, tokenizer, and image processor
-    if model_args.tokenizer_name:
+    if model_args.qformer_model_name_or_path:
         tokenizer = AutoTokenizer.from_pretrained(
-            model_args.tokenizer_name,
+            model_args.qformer_model_name_or_path,
             cache_dir=model_args.cache_dir,
             use_fast=model_args.use_fast_tokenizer,
             token=model_args.token,
             trust_remote_code=model_args.trust_remote_code,
         )
-    elif model_args.model_name_or_path:
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_args.model_name_or_path,
-            cache_dir=model_args.cache_dir,
-            use_fast=model_args.use_fast_tokenizer,
-            token=model_args.token,
-            trust_remote_code=model_args.trust_remote_code,
-        )
+        tokenizer.add_special_tokens({"bos_token": "[DEC]"})
     else:
         raise ValueError(
             "You are instantiating a new tokenizer from scratch. This is not supported by this script. "
@@ -315,32 +316,50 @@ def main():
         )
 
     # Load image_processor, in this script we only use this to get the mean and std for normalization.
-    image_processor = AutoImageProcessor.from_pretrained(
-        model_args.image_processor_name or model_args.model_name_or_path,
-        cache_dir=model_args.cache_dir,
-        revision=model_args.model_revision,
-        token=model_args.token,
-        trust_remote_code=model_args.trust_remote_code,
-    )
+    if model_args.vision_model_name_or_path:
+        image_processor = AutoImageProcessor.from_pretrained(
+            model_args.vision_model_name_or_path,
+            cache_dir=model_args.cache_dir,
+            revision=model_args.model_revision,
+            token=model_args.token,
+            trust_remote_code=model_args.trust_remote_code,
+        )
+    else:
+        raise ValueError()
 
-    model = AutoModel.from_pretrained(
-        model_args.model_name_or_path,
-        cache_dir=model_args.cache_dir,
-        revision=model_args.model_revision,
-        token=model_args.token,
-        trust_remote_code=model_args.trust_remote_code,
-    )
-    config = model.config
+    if model_args.qformer_model_name_or_path:
+        bert_config = AutoConfig.from_pretrained(
+            model_args.qformer_model_name_or_path,
+            cache_dir=model_args.cache_dir,
+            revision=model_args.model_revision,
+            token=model_args.token,
+            trust_remote_code=model_args.trust_remote_code,
+        )
+        vision_config = AutoConfig.from_pretrained(
+            model_args.vision_model_name_or_path,
+            cache_dir=model_args.cache_dir,
+            revision=model_args.model_revision,
+            token=model_args.token,
+            trust_remote_code=model_args.trust_remote_code,
+        )
+        vision_config = vision_config.vision_config
+        config = Blip2Config.from_vision_qformer_text_configs(vision_config, bert_config)
+        config.decoder_start_token_id = tokenizer.bos_token_id
+        model = Blip2ForQformerTraining(config=config)
+        model.from_qformer_pretrained(model_args.qformer_model_name_or_path)
+        model.resize_token_embeddings(len(tokenizer))
+        
+    else:
+        # logger.info("Training new model from scratch")
+        config = Blip2Model.config_class()
+        # model = Blip2ForQformerTraining()
+        pass
 
     def _freeze_params(module):
         for param in module.parameters():
             param.requires_grad = False
 
-    if model_args.freeze_vision_model:
-        _freeze_params(model.vision_model)
-
-    if model_args.freeze_text_model:
-        _freeze_params(model.text_model)
+    _freeze_params(model.vision_model)
 
     # set seed for torch dataloaders
     set_seed(training_args.seed)
@@ -483,7 +502,7 @@ def main():
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
         eval_dataset=eval_dataset if training_args.do_eval else None,
-        data_collator=collate_fn,
+        data_collator=get_collate_fn(tokenizer),
     )
 
     # 9. Training

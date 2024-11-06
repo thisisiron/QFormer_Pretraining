@@ -94,12 +94,14 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
 
     def __init__(self, config: Blip2Config):
         super().__init__(config)
-        self.decoder_start_token_id= config.decoder_start_token_id
+        self.decoder_start_token_id = config.decoder_start_token_id
 
         self.vision_model = Blip2VisionModel(config.vision_config)
 
         self.query_tokens = nn.Parameter(torch.zeros(1, config.num_query_tokens, config.qformer_config.hidden_size))
+        self.query_tokens.data.normal_(mean=0.0, std=config.qformer_config.initializer_range)
 
+        config.qformer_config.use_qformer_text_input = True
         self.embeddings = Blip2TextEmbeddings(config.qformer_config)
         self.qformer = Blip2QFormerModel(config.qformer_config)
         self.cls = Blip2QFormerOnlyMLMHead(config.qformer_config)
@@ -133,12 +135,12 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
 
     def set_output_embeddings(self, new_embeddings):
         self.cls.predictions.decoder = new_embeddings
+    
+    def from_qformer_pretrained(self, qformer_model_name_or_path: str):
 
-    def from_qformer_pretrained(self):
-
-        bert_config = BertConfig.from_pretrained("klue/bert-base")
+        bert_config = BertConfig.from_pretrained(qformer_model_name_or_path)
         bert_config.is_decoder = True
-        bert_model = BertLMHeadModel.from_pretrained("klue/bert-base", config=bert_config)
+        bert_model = BertLMHeadModel.from_pretrained(qformer_model_name_or_path, config=bert_config)
         bert_state_dict = bert_model.bert.state_dict()
 
         new_state_dict = {}
@@ -147,9 +149,6 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
         new_state_dict['layernorm.bias'] = bert_state_dict['embeddings.LayerNorm.bias']
 
         for key in bert_state_dict.keys():
-            # if 'embeddings' in key:
-            #     continue
-            
             new_key = key
             
             if 'self' in key:
@@ -178,6 +177,7 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
         use_image_text_matching_head: Optional[bool] = False,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
+        return_loss: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple]:#, Blip2ImageTextMatchingModelOutput]:
 
@@ -347,13 +347,17 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
         shift_labels = labels[..., 1:].contiguous().to(logits_itg.device)
 
         loss_itg = F.cross_entropy(shift_logits.view(-1, self.config.qformer_config.vocab_size), shift_labels.view(-1))
-
+        
+        loss = None
+        if return_loss:
+            loss = loss_itc + loss_itm + loss_itg
+        
         if not return_dict:
             output = (loss_itc + loss_itm + loss_itg)
             return output
 
         return Blip2QFormerModelOutput(
-                loss=loss_itc + loss_itm + loss_itg,
+                loss=loss,
                 loss_itc=loss_itc,
                 loss_itm=loss_itm,
                 loss_itg=loss_itg,
