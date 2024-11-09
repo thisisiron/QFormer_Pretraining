@@ -18,6 +18,7 @@ from torchvision.io import read_image, ImageReadMode
 from PIL import Image
 from datasets import load_dataset
 import transformers
+from transformers.utils import logging
 from transformers import (
     AutoConfig,
     AutoImageProcessor,
@@ -29,10 +30,15 @@ from transformers import (
     set_seed,
 )
 from model.blip2 import Blip2ForQformerTraining
-from transformers.models.blip_2.configuration_blip_2 import Blip2Config
+from transformers.models.blip_2.configuration_blip_2 import (
+    Blip2Config, 
+    Blip2QFormerConfig, 
+    Blip2VisionConfig
+)
+
 
 # Initialize logger
-logger = logging.getLogger(__name__)
+logger = logging.get_logger(__name__)
 
 
 @dataclass
@@ -232,11 +238,11 @@ def main():
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
     # 2. Setup logging
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
+    # logging.basicConfig(
+    #     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    #     datefmt="%m/%d/%Y %H:%M:%S",
+    #     handlers=[logging.StreamHandler(sys.stdout)],
+    # )
 
     if training_args.should_log:
         # The default of training_args.log_level is passive, so we set log level at info here to have that default.
@@ -343,7 +349,11 @@ def main():
             trust_remote_code=model_args.trust_remote_code,
         )
         vision_config = vision_config.vision_config
-        config = Blip2Config.from_vision_qformer_text_configs(vision_config, bert_config)
+
+        qformer_config = Blip2QFormerConfig(**bert_config.to_dict())
+        vision_config = Blip2VisionConfig(**vision_config.to_dict())
+
+        config = Blip2Config.from_vision_qformer_text_configs(vision_config, qformer_config)
         config.decoder_start_token_id = tokenizer.bos_token_id
         model = Blip2ForQformerTraining(config=config)
         model.from_qformer_pretrained(model_args.qformer_model_name_or_path)

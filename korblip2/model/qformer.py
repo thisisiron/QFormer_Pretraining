@@ -11,10 +11,15 @@ from transformers.modeling_outputs import (
     BaseModelOutputWithPooling,
     BaseModelOutputWithPoolingAndCrossAttentions,
 )
+from transformers.utils import logging
+from transformers.pytorch_utils import find_pruneable_heads_and_indices, prune_linear_layer
 from transformers.models.blip_2.configuration_blip_2 import Blip2QFormerConfig
 from transformers.pytorch_utils import apply_chunking_to_forward
 
 from .base import Blip2PreTrainedModel
+
+
+logger = logging.get_logger(__name__)
 
 
 class Blip2QFormerMultiHeadAttention(nn.Module):
