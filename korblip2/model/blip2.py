@@ -91,7 +91,8 @@ class Blip2QFormerModelOutput(ModelOutput):
 class Blip2ForQformerTraining(Blip2PreTrainedModel):
     main_input_name = "pixel_values"
     _keep_in_fp32_modules = []
-
+    _tied_weights_keys = ["cls.predictions.decoder.bias", "cls.predictions.decoder.weight"]
+    
     def __init__(self, config: Blip2Config):
         super().__init__(config)
         self.decoder_start_token_id = config.decoder_start_token_id
@@ -128,13 +129,14 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
         return self.embeddings.word_embeddings
     
     def set_input_embeddings(self, value):
-        self.embeddings.word_embedding = value 
+        self.embeddings.word_embeddings = value 
 
     def get_output_embeddings(self):
         return self.cls.predictions.decoder
 
     def set_output_embeddings(self, new_embeddings):
         self.cls.predictions.decoder = new_embeddings
+        self.cls.predictions.bias = new_embeddings.bias
     
     def from_qformer_pretrained(self, qformer_model_name_or_path: str):
 
@@ -142,7 +144,7 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
         bert_config.is_decoder = True
         bert_model = BertLMHeadModel.from_pretrained(qformer_model_name_or_path, config=bert_config)
         bert_state_dict = bert_model.bert.state_dict()
-
+    
         new_state_dict = {}
 
         new_state_dict['layernorm.weight'] = bert_state_dict['embeddings.LayerNorm.weight']
@@ -165,8 +167,12 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
             new_state_dict[new_key] = bert_state_dict[key]
 
         m, e = self.qformer.load_state_dict(new_state_dict, strict=False)
-        self.cls.load_state_dict(bert_model.cls.state_dict())
-        self.embeddings.load_state_dict(bert_model.bert.embeddings.state_dict(), strict=False)
+        # self.cls.load_state_dict(bert_model.cls.state_dict())
+        embeddings_dict = {}
+        embeddings_dict['word_embeddings.weight'] = bert_state_dict['embeddings.word_embeddings.weight']
+        embeddings_dict['position_embeddings.weight'] = bert_state_dict['embeddings.position_embeddings.weight']
+        m, e = self.embeddings.load_state_dict(embeddings_dict, strict=False)
+        # print(m, e)
 
     def forward(
         self,
