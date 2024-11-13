@@ -23,7 +23,9 @@ from transformers.models.blip_2.modeling_blip_2 import (
     Blip2VisionModel,
     Blip2PreTrainedModel,
     Blip2QFormerEncoder,
-    Blip2TextEmbeddings
+    Blip2TextEmbeddings,
+    Blip2VisionModelOutput,
+    Blip2TextModelOutput,
 )
 from transformers.modeling_outputs import (
     BaseModelOutputWithPoolingAndCrossAttentions,
@@ -79,6 +81,14 @@ class Blip2QFormerModelOutput(ModelOutput):
     loss_itc: Optional[torch.FloatTensor] = None
     loss_itm: Optional[torch.FloatTensor] = None
     loss_itg: Optional[torch.FloatTensor] = None
+
+
+@dataclass
+class Blip2MultimodalOutput:
+    multimodal_embeds: torch.FloatTensor = None
+    last_hidden_state: torch.FloatTensor = None
+    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    attentions: Optional[Tuple[torch.FloatTensor]] = None
 
 
 class Blip2QFormerModel(Blip2PreTrainedModel):
@@ -322,6 +332,15 @@ class Blip2QFormerOnlyMLMHead(nn.Module):
         prediction_scores = self.predictions(sequence_output)
         return prediction_scores
 
+class Blip2QformerLMHeadModel(Blip2PreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.embeddings = Blip2TextEmbeddings(config.qformer_config)
+        self.qformer = Blip2QFormerModel(config.qformer_config)
+        self.cls = Blip2QFormerOnlyMLMHead(config.qformer_config)
+
+        self.post_init()
+    
 
 class Blip2ForQformerTraining(Blip2PreTrainedModel):
     main_input_name = "pixel_values"
@@ -337,7 +356,7 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
         self.query_tokens = nn.Parameter(torch.zeros(1, config.num_query_tokens, config.qformer_config.hidden_size))
         self.query_tokens.data.normal_(mean=0.0, std=config.qformer_config.initializer_range)
 
-        config.qformer_config.use_qformer_text_input = True
+        # config.qformer_config.use_qformer_text_input = True
         self.embeddings = Blip2TextEmbeddings(config.qformer_config)
         self.qformer = Blip2QFormerModel(config.qformer_config)
         self.cls = Blip2QFormerOnlyMLMHead(config.qformer_config)
@@ -376,7 +395,8 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
     def from_qformer_pretrained(self, qformer_model_name_or_path: str):
 
         bert_config = BertConfig.from_pretrained(qformer_model_name_or_path)
-        bert_config.is_decoder = True
+        # bert_config.is_decoder = True
+        # import pdb;pdb.set_trace()
         bert_model = BertLMHeadModel.from_pretrained(qformer_model_name_or_path, config=bert_config)
         bert_state_dict = bert_model.bert.state_dict()
     
@@ -471,7 +491,7 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
         sim_i2t = torch.matmul(image_feats, text_feats_all.t())
         sim_i2t, _ = sim_i2t.max(dim=1)
 
-        sim_t2i = torch.matmul(image_feats_all, text_feats.t())
+        sim_t2i = torch.matmul(image_feats_all, text_feats.t())  # TODO: check transposed
         sim_t2i, _ = sim_t2i.max(dim=1)
         sim_t2i = sim_t2i.t()
 
@@ -602,4 +622,162 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
                 loss_itc=loss_itc,
                 loss_itm=loss_itm,
                 loss_itg=loss_itg,
+        )
+    
+    def get_image_features(
+        self,
+        pixel_values: Optional[torch.FloatTensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ):
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        vision_outputs = self.vision_model(
+            pixel_values=pixel_values,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        pooled_output = vision_outputs[0] if not return_dict else vision_outputs.last_hidden_state
+
+        image_attention_mask = torch.ones(pooled_output.size()[:-1], dtype=torch.long, device=pooled_output.device)
+
+        query_tokens = self.query_tokens.expand(pooled_output.shape[0], -1, -1)
+
+        query_outputs = self.qformer(
+            query_embeds=query_tokens,
+            encoder_hidden_states=pooled_output,
+            encoder_attention_mask=image_attention_mask,
+            return_dict=return_dict,
+        )
+
+        embeds = query_outputs[0] if not return_dict else query_outputs.last_hidden_state
+        image_embeds = self.vision_projection(embeds)
+        image_embeds = nn.functional.normalize(image_embeds, dim=-1)
+
+        if not return_dict:
+            outputs = (image_embeds, vision_outputs[0]) + vision_outputs[2:]
+            return tuple(output for output in outputs if output is not None)
+
+        return Blip2VisionModelOutput(
+            image_embeds=image_embeds,
+            last_hidden_state=vision_outputs.last_hidden_state,
+            hidden_states=vision_outputs.hidden_states,
+            attentions=vision_outputs.attentions,
+        )
+    
+    def get_text_features(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ):
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        query_embeds = self.embeddings(
+            input_ids=input_ids,
+            position_ids=position_ids,
+        )
+
+        text_outputs = self.qformer(
+            query_embeds=query_embeds,
+            query_length=0,
+            attention_mask=attention_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        pooled_output = text_outputs[0] if not return_dict else text_outputs.last_hidden_state
+
+        text_embeds = self.text_projection(pooled_output)
+        text_embeds = nn.functional.normalize(text_embeds, dim=-1)
+
+        if not return_dict:
+            outputs = (text_embeds, text_outputs[0]) + text_outputs[2:]
+            return tuple(output for output in outputs if output is not None)
+
+        return Blip2TextModelOutput(
+            text_embeds=text_embeds,
+            last_hidden_state=text_outputs.last_hidden_state,
+            hidden_states=text_outputs.hidden_states,
+            attentions=text_outputs.attentions,
+        )
+    
+    def get_multimodal_features(
+        self,
+        pixel_values: Optional[torch.FloatTensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ):
+        """
+        Get multimodal features by processing both image and text inputs together.
+        """
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # Process image through vision model
+        vision_outputs = self.vision_model(
+            pixel_values=pixel_values,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        
+        pooled_output = vision_outputs[0] if not return_dict else vision_outputs.last_hidden_state
+        
+        # Create image attention mask
+        image_attention_mask = torch.ones(pooled_output.size()[:-1], dtype=torch.long, device=pooled_output.device)
+        
+        # Expand query tokens
+        query_tokens = self.query_tokens.expand(pooled_output.shape[0], -1, -1)
+        query_attention_mask = torch.ones(query_tokens.size()[:-1], dtype=torch.long, device=query_tokens.device)
+        
+        # Process text embeddings
+        query_embeds = self.embeddings(
+            input_ids=input_ids,
+            query_embeds=query_tokens,
+        )
+        
+        # Combine attention masks
+        combined_attention_mask = torch.cat([query_attention_mask, attention_mask], dim=1)
+        
+        # Get multimodal outputs through qformer
+        multimodal_outputs = self.qformer(
+            query_embeds=query_embeds,
+            query_length=query_tokens.shape[1],
+            attention_mask=combined_attention_mask,
+            encoder_hidden_states=pooled_output,
+            encoder_attention_mask=image_attention_mask,
+            return_dict=return_dict,
+        )
+        
+        # Extract multimodal embeddings from the query tokens part
+        multimodal_embeds = multimodal_outputs[0] if not return_dict else multimodal_outputs.last_hidden_state
+        multimodal_embeds = multimodal_embeds[:, :query_tokens.size(1), :]
+        
+        if not return_dict:
+            outputs = (multimodal_embeds, vision_outputs[0]) + vision_outputs[2:]
+            return tuple(output for output in outputs if output is not None)
+        
+        return Blip2MultimodalOutput(
+            multimodal_embeds=multimodal_embeds,
+            last_hidden_state=vision_outputs.last_hidden_state,
+            hidden_states=vision_outputs.hidden_states,
+            attentions=vision_outputs.attentions,
         )

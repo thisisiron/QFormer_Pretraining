@@ -537,7 +537,7 @@ def main():
         trainer.save_metrics("eval", metrics)
 
     # 11. Write Training Stats and push to hub.
-    finetuned_from = model_args.model_name_or_path
+    finetuned_from = model_args.vision_model_name_or_path
     # If from a local directory, don't set `finetuned_from` as this is required to be a valid repo. id on the Hub.
     if os.path.isdir(finetuned_from):
         finetuned_from = None
