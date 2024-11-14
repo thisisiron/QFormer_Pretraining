@@ -12,6 +12,7 @@ from transformers.utils import (
     ModelOutput
 )
 from transformers.activations import ACT2FN
+from transformers.generation import GenerationMixin
 from transformers.models.bert.configuration_bert import BertConfig
 from transformers.models.bert.modeling_bert import BertLMHeadModel
 from transformers.models.blip_2.configuration_blip_2 import (
@@ -59,8 +60,8 @@ def concat_all_gather(tensor: torch.Tensor, with_grad: bool = False) -> torch.Te
 
 # Model output classes 
 @dataclass
-class BlipIntermediateOutput(ModelOutput):
-    """Intermediate outputs for BLIP model."""
+class Blip2IntermediateOutput(ModelOutput):
+    """Intermediate outputs for BLIP2 model."""
     image_embeds: torch.FloatTensor = None
     text_embeds: Optional[torch.FloatTensor] = None
     image_embeds_m: Optional[torch.FloatTensor] = None 
@@ -76,7 +77,7 @@ class BlipIntermediateOutput(ModelOutput):
 @dataclass
 class Blip2QFormerModelOutput(ModelOutput):
     """Outputs of the QFormer model."""
-    intermediate_output: BlipIntermediateOutput = None
+    intermediate_output: Blip2IntermediateOutput = None
     loss: Optional[torch.FloatTensor] = None
     loss_itc: Optional[torch.FloatTensor] = None
     loss_itm: Optional[torch.FloatTensor] = None
@@ -84,7 +85,7 @@ class Blip2QFormerModelOutput(ModelOutput):
 
 
 @dataclass
-class Blip2MultimodalOutput:
+class Blip2MultimodalOutput(ModelOutput):
     multimodal_embeds: torch.FloatTensor = None
     last_hidden_state: torch.FloatTensor = None
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
@@ -205,13 +206,13 @@ class Blip2QFormerModel(Blip2PreTrainedModel):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        query_length = (
-            query_length if query_length is not None else query_embeds.shape[1] if query_embeds is not None else 0
-        )
-
         # past_key_values_length
         past_key_values_length = (
             past_key_values[0][0].shape[2] - query_length if past_key_values is not None else 0
+        )
+
+        query_length = (
+            query_length if query_length is not None else query_embeds.shape[1] if query_embeds is not None else 0
         )
 
         embedding_output = self.layernorm(query_embeds)
@@ -332,20 +333,124 @@ class Blip2QFormerOnlyMLMHead(nn.Module):
         prediction_scores = self.predictions(sequence_output)
         return prediction_scores
 
-class Blip2QformerLMHeadModel(Blip2PreTrainedModel):
-    def __init__(self, config):
-        super().__init__(config)
-        self.embeddings = Blip2TextEmbeddings(config.qformer_config)
-        self.qformer = Blip2QFormerModel(config.qformer_config)
-        self.cls = Blip2QFormerOnlyMLMHead(config.qformer_config)
 
+class Blip2QformerLMHeadModel(Blip2PreTrainedModel):
+    _tied_weights_keys = ["cls.predictions.decoder.bias", "cls.predictions.decoder.weight"]
+
+    def __init__(self, config: Blip2QFormerConfig):
+        super().__init__(config)
+        
+        self.embeddings = Blip2TextEmbeddings(config)
+        self.qformer = Blip2QFormerModel(config)
+        self.cls = Blip2QFormerOnlyMLMHead(config)
         self.post_init()
     
+    def resize_token_embeddings(self, new_num_tokens: Optional[int] = None, pad_to_multiple_of=None) -> nn.Embedding:
+        model_embeds = super().resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
+        # update vocab size
+        self.config.vocab_size = model_embeds.num_embeddings
+        return model_embeds
+    
+    def set_input_embeddings(self, value):
+        self.embeddings.word_embeddings = value 
 
-class Blip2ForQformerTraining(Blip2PreTrainedModel):
+    def get_input_embeddings(self):
+        return self.embeddings.word_embeddings
+    
+    def get_output_embeddings(self):
+        return self.cls.predictions.decoder
+
+    def set_output_embeddings(self, new_embeddings):
+        self.cls.predictions.decoder = new_embeddings
+        self.cls.predictions.bias = new_embeddings.bias
+
+    def forward(
+        self,
+        query_embeds: torch.FloatTensor,
+        query_length: Optional[int] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        reduction: str = "mean",
+    ) -> Union[Tuple[torch.Tensor], CausalLMOutputWithCrossAttentions]:
+        r"""
+        encoder_hidden_states  (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, `optional`):
+            Sequence of hidden-states at the output of the last layer of the encoder. Used in the cross-attention if
+            the model is configured as a decoder.
+        encoder_attention_mask (`torch.FloatTensor` of shape `(batch_size, sequence_length)`, `optional`):
+            Mask to avoid performing attention on the padding token indices of the encoder input. This mask is used in
+            the cross-attention if the model is configured as a decoder. Mask values selected in `[0, 1]`:
+            - 1 for tokens that are **not masked**,
+            - 0 for tokens that are **masked**.
+        past_key_values (`tuple(tuple(torch.FloatTensor))` of length `config.n_layers` with each tuple having 4 tensors of:
+            shape `(batch_size, num_heads, sequence_length - 1, embed_size_per_head)`): Contains precomputed key and
+            value hidden states of the attention blocks. Can be used to speed up decoding. If `past_key_values` are
+            used, the user can optionally input only the last `decoder_input_ids` (those that don't have their past key
+            value states given to this model) of shape `(batch_size, 1)` instead of all `decoder_input_ids` of shape
+            `(batch_size, sequence_length)`.
+        use_cache (`bool`, `optional`):
+            If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding (see
+            `past_key_values`).
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        if labels is not None:
+            use_cache = False
+
+        qformer_outputs = self.qformer(
+            query_embeds=query_embeds,
+            query_length=query_length,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        sequence_output = qformer_outputs.last_hidden_state if return_dict else qformer_outputs[0]
+        if query_length > 0:
+            sequence_output = sequence_output[:, query_length:, :]
+        prediction_scores = self.cls(sequence_output)
+        
+        lm_loss = None
+        if labels is not None:
+            # labels = labels.to(prediction_scores.device)
+            # Shift so that tokens < n predict n
+            shifted_prediction_scores  = prediction_scores[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+
+            loss_fct = nn.CrossEntropyLoss()
+            lm_loss = loss_fct(shifted_prediction_scores.view(-1, self.config.vocab_size), shift_labels.view(-1))
+
+            if reduction == "none":
+                lm_loss = lm_loss.view(prediction_scores.size(0), -1).sum(1)
+
+        if not return_dict:
+            output = (prediction_scores,) + qformer_outputs[2:]
+            return ((lm_loss,) + output) if lm_loss is not None else output
+
+        return CausalLMOutputWithCrossAttentions(
+            loss=lm_loss,
+            logits=prediction_scores,
+            past_key_values=qformer_outputs.past_key_values,
+            hidden_states=qformer_outputs.hidden_states,
+            attentions=qformer_outputs.attentions,
+            cross_attentions=qformer_outputs.cross_attentions,
+        )
+
+
+class Blip2ForQformerTraining(Blip2PreTrainedModel, GenerationMixin):
     main_input_name = "pixel_values"
     _keep_in_fp32_modules = []
-    _tied_weights_keys = ["cls.predictions.decoder.bias", "cls.predictions.decoder.weight"]
     
     def __init__(self, config: Blip2Config):
         super().__init__(config)
@@ -357,9 +462,7 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
         self.query_tokens.data.normal_(mean=0.0, std=config.qformer_config.initializer_range)
 
         # config.qformer_config.use_qformer_text_input = True
-        self.embeddings = Blip2TextEmbeddings(config.qformer_config)
-        self.qformer = Blip2QFormerModel(config.qformer_config)
-        self.cls = Blip2QFormerOnlyMLMHead(config.qformer_config)
+        self.qformer_lm = Blip2QformerLMHeadModel(config.qformer_config)
 
         # vision projection layer
         self.vision_projection = nn.Linear(config.qformer_config.hidden_size, config.image_text_hidden_size)
@@ -373,81 +476,24 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    def resize_token_embeddings(self, new_num_tokens: Optional[int] = None, pad_to_multiple_of=None) -> nn.Embedding:
-        model_embeds = super().resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
-        # update vocab size
-        self.config.qformer_config.vocab_size = model_embeds.num_embeddings
-        return model_embeds
-
-    def get_input_embeddings(self):
-        return self.embeddings.word_embeddings
-    
-    def set_input_embeddings(self, value):
-        self.embeddings.word_embeddings = value 
-
-    def get_output_embeddings(self):
-        return self.cls.predictions.decoder
-
-    def set_output_embeddings(self, new_embeddings):
-        self.cls.predictions.decoder = new_embeddings
-        self.cls.predictions.bias = new_embeddings.bias
-    
-    def from_qformer_pretrained(self, qformer_model_name_or_path: str):
-
-        bert_config = BertConfig.from_pretrained(qformer_model_name_or_path)
-        # bert_config.is_decoder = True
-        # import pdb;pdb.set_trace()
-        bert_model = BertLMHeadModel.from_pretrained(qformer_model_name_or_path, config=bert_config)
-        bert_state_dict = bert_model.bert.state_dict()
-    
-        new_state_dict = {}
-
-        new_state_dict['layernorm.weight'] = bert_state_dict['embeddings.LayerNorm.weight']
-        new_state_dict['layernorm.bias'] = bert_state_dict['embeddings.LayerNorm.bias']
-
-        for key in bert_state_dict.keys():
-            new_key = key
-            
-            if 'self' in key:
-                new_key = key.replace('self', 'attention')
-            
-            if 'intermediate' in key:
-                intermediate_query_key = key.replace('intermediate', 'intermediate_query')
-                new_state_dict[intermediate_query_key] = bert_state_dict[key]
-                
-            if 'output' in key and 'attention.output' not in key:
-                output_query_key = key.replace('output', 'output_query')
-                new_state_dict[output_query_key] = bert_state_dict[key]
-            
-            new_state_dict[new_key] = bert_state_dict[key]
-
-        m, e = self.qformer.load_state_dict(new_state_dict, strict=False)
-        # self.cls.load_state_dict(bert_model.cls.state_dict())
-        embeddings_dict = {}
-        embeddings_dict['word_embeddings.weight'] = bert_state_dict['embeddings.word_embeddings.weight']
-        embeddings_dict['position_embeddings.weight'] = bert_state_dict['embeddings.position_embeddings.weight']
-        m, e = self.embeddings.load_state_dict(embeddings_dict, strict=False)
-        # print(m, e)
-
     def forward(
         self,
         pixel_values: torch.FloatTensor,
         input_ids: torch.LongTensor,
         attention_mask: Optional[torch.LongTensor] = None,
         labels: Optional[torch.LongTensor] = None,
-        use_image_text_matching_head: Optional[bool] = False,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_loss: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-    ) -> Union[Tuple]:#, Blip2ImageTextMatchingModelOutput]:
-
+    ) -> Union[Tuple, Blip2QFormerModelOutput]:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
+        # itc
         vision_outputs = self.vision_model(
             pixel_values=pixel_values,
             output_attentions=output_attentions,
@@ -459,10 +505,11 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
         image_attention_mask = torch.ones(image_embeds.size()[:-1], dtype=torch.long, device=pixel_values.device)
 
         query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
-        query_embeds = self.embeddings(
+        query_embeds = self.qformer_lm.embeddings(
             query_embeds=query_tokens,
         )
-        query_outputs = self.qformer(
+
+        query_outputs = self.qformer_lm.qformer(
             query_embeds=query_embeds,
             encoder_hidden_states=image_embeds,
             encoder_attention_mask=image_attention_mask,
@@ -472,11 +519,10 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
         # query_outputs = query_outputs[0] if not return_dict else query_outputs.last_hidden_state
         image_feats = nn.functional.normalize(self.vision_projection(query_outputs.last_hidden_state), dim=-1)
 
-        # TODO: add tokenizer 
-        text_embeds = self.embeddings(
+        text_embeds = self.qformer_lm.embeddings(
             input_ids=input_ids,
         )
-        text_outputs = self.qformer(
+        text_outputs = self.qformer_lm.qformer(
             query_embeds=text_embeds,
             query_length=0,
             attention_mask=attention_mask,
@@ -491,7 +537,7 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
         sim_i2t = torch.matmul(image_feats, text_feats_all.t())
         sim_i2t, _ = sim_i2t.max(dim=1)
 
-        sim_t2i = torch.matmul(image_feats_all, text_feats.t())  # TODO: check transposed
+        sim_t2i = torch.matmul(image_feats_all, text_feats.t())
         sim_t2i, _ = sim_t2i.max(dim=1)
         sim_t2i = sim_t2i.t()
 
@@ -507,7 +553,7 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
             + F.cross_entropy(sim_t2i, targets, label_smoothing=0.1)
         ) / 2
 
-
+        # itm
         sim_t2i[:, rank * bs : rank * bs + bs].fill_diagonal_(-10000)
         sim_i2t[:, rank * bs : rank * bs + bs].fill_diagonal_(-10000)
 
@@ -547,7 +593,7 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
         )
         attention_mask_all = torch.cat([query_atts_itm, text_atts_all], dim=1)
 
-        query_embeds_itm = self.embeddings(
+        query_embeds_itm = self.qformer_lm.embeddings(
             input_ids=text_ids_all,
             query_embeds=query_tokens_itm,
         )
@@ -559,7 +605,7 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
             pixel_values.device
         )
 
-        itm_outputs = self.qformer(
+        itm_outputs = self.qformer_lm.qformer(
             query_embeds=query_embeds_itm,
             query_length=query_tokens_itm.shape[1],
             attention_mask=attention_mask_all,
@@ -580,35 +626,27 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
         # ITG
         decoder_input_ids = input_ids.clone()
         decoder_input_ids[:, 0] = self.decoder_start_token_id
-
+        
         query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(  # 4 32
             pixel_values.device
         )
 
-        decoder_embeds = self.embeddings(  # 4, 64, 768
+        decoder_embeds = self.qformer_lm.embeddings(
             input_ids=decoder_input_ids,
-            # query_embeds=query_tokens,
         )
-
-        attention_mask_itg = torch.cat([query_atts, attention_mask], dim=1)
-
-        itg_outputs = self.qformer(
-            decoder_embeds,
+        attention_mask_itg = torch.cat([query_atts, attention_mask], dim=1).to(pixel_values.device)
+        
+        lm_output = self.qformer_lm(
+            query_embeds=decoder_embeds,
             query_length=0,
             attention_mask=attention_mask_itg,
             past_key_values=query_outputs.past_key_values,
             return_dict=True,
+            labels=labels,
         )
-        logits_itg = self.cls(itg_outputs.last_hidden_state)
 
-        # labels = labels.to(logits_itg.device)
-        logits_itg = logits_itg[:, -labels.size(1) :, :]
-        # Shift so that tokens < n predict n
-        shift_logits = logits_itg[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous().to(logits_itg.device)
+        loss_itg = lm_output.loss
 
-        loss_itg = F.cross_entropy(shift_logits.view(-1, self.config.qformer_config.vocab_size), shift_labels.view(-1))
-        
         loss = None
         if return_loss:
             loss = loss_itc + loss_itm + loss_itg
@@ -650,7 +688,7 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
 
         query_tokens = self.query_tokens.expand(pooled_output.shape[0], -1, -1)
 
-        query_outputs = self.qformer(
+        query_outputs = self.qformer_lm.qformer(
             query_embeds=query_tokens,
             encoder_hidden_states=pooled_output,
             encoder_attention_mask=image_attention_mask,
@@ -683,12 +721,12 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
     ):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        query_embeds = self.embeddings(
+        query_embeds = self.qformer_lm.embeddings(
             input_ids=input_ids,
             position_ids=position_ids,
         )
 
-        text_outputs = self.qformer(
+        text_outputs = self.qformer_lm.qformer(
             query_embeds=query_embeds,
             query_length=0,
             attention_mask=attention_mask,
@@ -749,7 +787,7 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
         query_attention_mask = torch.ones(query_tokens.size()[:-1], dtype=torch.long, device=query_tokens.device)
         
         # Process text embeddings
-        query_embeds = self.embeddings(
+        query_embeds = self.qformer_lm.embeddings(
             input_ids=input_ids,
             query_embeds=query_tokens,
         )
@@ -758,7 +796,7 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
         combined_attention_mask = torch.cat([query_attention_mask, attention_mask], dim=1)
         
         # Get multimodal outputs through qformer
-        multimodal_outputs = self.qformer(
+        multimodal_outputs = self.qformer_lm.qformer(
             query_embeds=query_embeds,
             query_length=query_tokens.shape[1],
             attention_mask=combined_attention_mask,
@@ -781,3 +819,42 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
             hidden_states=vision_outputs.hidden_states,
             attentions=vision_outputs.attentions,
         )
+
+    # @torch.no_grad()
+    # def generate(
+    #     self,
+    #     pixel_values: Optional[torch.FloatTensor] = None,
+    #     input_ids: Optional[torch.LongTensor] = None,
+    #     output_attentions: Optional[bool] = None,
+    #     output_hidden_states: Optional[bool] = None,
+    #     **generate_kwargs,
+    # ):
+    #     vision_outputs = self.vision_model(
+    #         pixel_values=pixel_values,
+    #         output_attentions=output_attentions,
+    #         output_hidden_states=output_hidden_states,
+    #         return_dict=True,
+    #     )
+    #     pooled_output = vision_outputs.last_hidden_state
+
+    #     image_attention_mask = torch.ones(pooled_output.size()[:-1], dtype=torch.long, device=pooled_output.device)
+
+    #     query_tokens = self.query_tokens.expand(pooled_output.shape[0], -1, -1)
+
+    #     query_embeds = self.embeddings(
+    #         input_ids=input_ids,
+    #         query_embeds=query_tokens,
+    #     )
+
+    #     query_outputs = self.qformer.generate(
+    #         query_embeds=query_embeds,
+    #         encoder_hidden_states=pooled_output,
+    #         encoder_attention_mask=image_attention_mask,
+    #         return_dict=True,
+    #     )
+        
+    #     sequence_output = query_outputs.last_hidden_state[:, query_embeds.shape[1] :, :]
+    #     prediction_scores = self.cls(sequence_output)
+
+    #     # query_output = query_outputs.last_hidden_state
+    #     import pdb; pdb.set_trace()
