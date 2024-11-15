@@ -431,8 +431,8 @@ def convert_blip2_checkpoint(
         hf_model.save_pretrained(pytorch_dump_folder_path)
 
     if push_to_hub:
-        processor.push_to_hub(f"thisisiron/{model_name}")
-        hf_model.push_to_hub(f"thisisiron/{model_name}")
+        processor.push_to_hub(f"thisisiron/lavis-{model_name}")
+        hf_model.push_to_hub(f"thisisiron/lavis-{model_name}")
 
 
 if __name__ == "__main__":
