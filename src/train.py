@@ -29,7 +29,7 @@ from transformers import (
     TrainingArguments,
     set_seed,
 )
-from model.blip2 import Blip2ForQformerTraining
+from blip_2.modeling_blip2 import Blip2ForQformerTraining
 from transformers.models.blip_2.configuration_blip_2 import (
     Blip2Config, 
     Blip2QFormerConfig, 
@@ -362,8 +362,7 @@ def main():
         config.qformer_config.use_qformer_text_input = True
         config.decoder_start_token_id = tokenizer.bos_token_id
         model = Blip2ForQformerTraining(config=config)
-        # model.from_qformer_pretrained(model_args.qformer_model_name_or_path)
-        model.qformer_lm.resize_token_embeddings(len(tokenizer))
+        model.text_model.resize_token_embeddings(len(tokenizer))
         
     else:
         # logger.info("Training new model from scratch")
