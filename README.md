@@ -1,5 +1,5 @@
 # Pre-training Q-Former
-This repository contains code for pre-training Q-Former using the transformers library. The code supports both training from scratch and converting pre-trained LAVIS BLIP-2 models to the PyTorch transformers format.
+This repository contains code for pre-training Q-Former using the transformers library. The code supports training converting pre-trained LAVIS BLIP-2 models to the PyTorch transformers format.
 
 ### Features
 
@@ -7,13 +7,6 @@ This repository contains code for pre-training Q-Former using the transformers l
 - Convert LAVIS BLIP-2 Q-Former weights to transformers format
 
 ## Usage
-
-### From Scratch
-To run the script for pre-training Q-Former from scratch, use the following command:
-```
-sh run.sh
-```
-
 
 ### From LAVIS BLIP-2
 To run the script for pre-training Q-Former from lavis, use the following command:
