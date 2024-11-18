@@ -268,13 +268,13 @@ def convert_blip2_checkpoint(
         caption = "a large fountain spewing water into the air"
         input_ids = tokenizer([caption], return_tensors="pt").input_ids.to(hf_model_device)
         attention_mask = processor(text=caption, return_tensors="pt").attention_mask.to(hf_model_device)
-
+        
         with torch.no_grad():
             original_logits = original_model(
                 {"image": original_pixel_values, "text_input": [caption]}, match_head="itm"
             )
             logits = hf_model(
-                pixel_values=original_pixel_values,
+                pixel_values=pixel_values,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 use_image_text_matching_head=True,
@@ -299,7 +299,7 @@ def convert_blip2_checkpoint(
                     {"image": original_pixel_values, "text_input": [caption]}, match_head="itc"
                 )
                 logits = hf_model(
-                    pixel_values=original_pixel_values,
+                    pixel_values=pixel_values,
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     use_image_text_matching_head=False,
@@ -316,6 +316,9 @@ def convert_blip2_checkpoint(
             print("Looks ok!")
 
     elif "qformer" in model_name:
+        hf_model.config.qformer_config.use_qformer_text_input = True
+        hf_model.config.decoder_start_token_id = tokenizer.bos_token_id
+
         caption = "a large fountain spewing water into the air"
         text_tokens = tokenizer([caption], return_tensors="pt").to(hf_model_device)
 
@@ -324,7 +327,7 @@ def convert_blip2_checkpoint(
                 {"image": original_pixel_values}, mode="image"
             ).image_embeds_proj
             image_embeds = hf_model.get_image_features(
-                pixel_values=original_pixel_values
+                pixel_values=pixel_values
             ).image_embeds
             target_dtype = image_embeds.dtype
             assert torch.allclose(original_image_embeds.to(target_dtype), image_embeds, atol=1e-4)
@@ -344,7 +347,7 @@ def convert_blip2_checkpoint(
                 {"image": original_pixel_values, "text_input": [caption]}, mode="multimodal"
             ).multimodal_embeds
             multimodal_embeds = hf_model.get_multimodal_features(
-                pixel_values=original_pixel_values,
+                pixel_values=pixel_values,
                 input_ids=text_tokens.input_ids,
                 attention_mask=text_tokens.attention_mask,
             ).multimodal_embeds
@@ -368,7 +371,7 @@ def convert_blip2_checkpoint(
 
             text_tokens = tokenizer(["[DEC]"], return_tensors="pt", add_special_tokens=False).to(hf_model_device)
             outputs = hf_model.generate(
-                pixel_values=original_pixel_values,
+                pixel_values=pixel_values,
                 input_ids=text_tokens.input_ids,
                 attention_mask=text_tokens.attention_mask,
                 do_sample=True,
@@ -429,7 +432,7 @@ def convert_blip2_checkpoint(
     if pytorch_dump_folder_path is not None:
         processor.save_pretrained(pytorch_dump_folder_path)
         hf_model.save_pretrained(pytorch_dump_folder_path)
-
+        
     if push_to_hub:
         processor.push_to_hub(f"thisisiron/lavis-{model_name}")
         hf_model.push_to_hub(f"thisisiron/lavis-{model_name}")

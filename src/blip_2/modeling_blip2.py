@@ -26,6 +26,7 @@ from transformers.models.blip_2.modeling_blip_2 import (
     Blip2QFormerEncoder,
     Blip2VisionModelOutput,
     Blip2TextModelOutput,
+    Blip2ImageTextMatchingModelOutput,
 )
 from transformers.modeling_outputs import (
     BaseModelOutputWithPoolingAndCrossAttentions,
@@ -438,26 +439,19 @@ class Blip2QformerLMHeadModel(Blip2PreTrainedModel, GenerationMixin):
         
         self.qformer = Blip2QFormerModel(config)
         self.cls = Blip2QFormerOnlyMLMHead(config)
-        self.post_init()
     
-    def resize_token_embeddings(self, new_num_tokens: Optional[int] = None, pad_to_multiple_of=None) -> nn.Embedding:
-        model_embeds = super().resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
-        # update vocab size
-        self.config.vocab_size = model_embeds.num_embeddings
-        return model_embeds
-    
-    def get_input_embeddings(self):
-        return self.qformer.get_input_embeddings()
-
-    def set_input_embeddings(self, new_embeddings):
-        self.qformer.set_input_embeddings(new_embeddings)
+    # def resize_token_embeddings(self, new_num_tokens: Optional[int] = None, pad_to_multiple_of=None) -> nn.Embedding:
+    #     model_embeds = self.qformer.get_input_embeddings()
+    #     # update vocab size
+    #     self.config.vocab_size = model_embeds.num_embeddings
+    #     return model_embeds
     
     def get_output_embeddings(self):
         return self.cls.predictions.decoder
 
     def set_output_embeddings(self, new_embeddings):
         self.cls.predictions.decoder = new_embeddings
-        self.cls.predictions.bias = new_embeddings.bias
+        # self.cls.predictions.bias = new_embeddings.bias
 
     def forward(
         self,
@@ -587,7 +581,7 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
         self.vision_model = Blip2VisionModel(config.vision_config)
 
         self.query_tokens = nn.Parameter(torch.zeros(1, config.num_query_tokens, config.qformer_config.hidden_size))
-        self.query_tokens.data.normal_(mean=0.0, std=config.qformer_config.initializer_range)
+        # self.query_tokens.data.normal_(mean=0.0, std=config.qformer_config.initializer_range)
 
         # config.qformer_config.use_qformer_text_input = True
         self.text_model = Blip2QformerLMHeadModel(config.qformer_config)
@@ -603,6 +597,18 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
+    
+    def get_input_embeddings(self):
+        return self.text_model.qformer.get_input_embeddings()
+    
+    def set_input_embeddings(self, new_embeddings):
+        self.text_model.qformer.set_input_embeddings(new_embeddings)
+
+    def get_output_embeddings(self):
+        return self.text_model.get_output_embeddings()
+    
+    def set_output_embeddings(self, new_embeddings):
+        self.text_model.set_output_embeddings(new_embeddings)
 
     def forward(
         self,
@@ -750,7 +756,6 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
         
         lm_output = self.text_model(
             input_ids=decoder_input_ids,
-            # query_embeds=decoder_embeds,
             attention_mask=attention_mask_itg,
             past_key_values=query_outputs.past_key_values,
             return_dict=True,
@@ -951,3 +956,88 @@ class Blip2ForQformerTraining(Blip2PreTrainedModel):
         )
 
         return outputs
+
+    def get_matching(
+        self,
+        pixel_values: torch.FloatTensor,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.LongTensor] = None,
+        use_image_text_matching_head: Optional[bool] = False,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, Blip2ImageTextMatchingModelOutput]:
+        
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+
+        vision_outputs = self.vision_model(
+            pixel_values=pixel_values,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        image_embeds = vision_outputs[0]
+        image_attention_mask = torch.ones(image_embeds.size()[:-1], dtype=torch.long, device=image_embeds.device)
+
+        if use_image_text_matching_head:
+            query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
+            query_attention_mask = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(query_tokens.device)
+            attention_mask = torch.cat([query_attention_mask, attention_mask], dim=1)
+
+            text_outputs = self.text_model.qformer(
+                input_ids=input_ids,
+                query_embeds=query_tokens,
+                attention_mask=attention_mask,
+                encoder_hidden_states=image_embeds,
+                encoder_attention_mask=image_attention_mask,
+                return_dict=return_dict,
+            )
+            text_embeds = text_outputs[0] if not return_dict else text_outputs.last_hidden_state
+
+            output = self.itm_head(text_embeds[:, : query_tokens.size(1), :])
+            logits_per_image = output.mean(dim=1)
+            logits_per_text = logits_per_image.t()
+        else:
+            query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
+            query_outputs = self.text_model.qformer(
+                query_embeds=query_tokens,
+                encoder_hidden_states=image_embeds,
+                encoder_attention_mask=image_attention_mask,
+                return_dict=return_dict,
+            )
+            image_embeds = query_outputs[0] if not return_dict else query_outputs.last_hidden_state
+
+            text_outputs = self.text_model.qformer(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                return_dict=return_dict,
+            )
+            question_embeds = text_outputs[0] if not return_dict else text_outputs.last_hidden_state
+
+            # normalized features
+            image_embeds = nn.functional.normalize(self.vision_projection(image_embeds), dim=-1)
+            text_embeds = nn.functional.normalize(self.text_projection(question_embeds[:, 0, :]), dim=-1)
+
+            # cosine similarity as logits
+            logits_per_image = torch.matmul(image_embeds, text_embeds.t())
+            logits_per_image, _ = logits_per_image.max(dim=1)
+
+            logits_per_text = logits_per_image.t()
+
+        if not return_dict:
+            output = (logits_per_image, logits_per_text, text_embeds, image_embeds, text_outputs, vision_outputs)
+            return output
+
+        return Blip2ImageTextMatchingModelOutput(
+            logits_per_image=logits_per_image,
+            logits_per_text=logits_per_text,
+            text_embeds=text_embeds,
+            image_embeds=image_embeds,
+            text_model_output=text_outputs,
+            vision_model_output=vision_outputs,
+        )
